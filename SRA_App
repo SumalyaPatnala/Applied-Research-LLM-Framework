@@ -1,0 +1,162 @@
+import streamlit as st
+from io import BytesIO
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.chat_models import ChatOllama
+from langchain_core.runnables import RunnablePassthrough
+from langchain.retrievers.multi_query import MultiQueryRetriever
+import pandas as pd
+import pdfplumber
+import pytesseract
+
+
+def extract_pdf_text(uploaded_file):
+    """Load and extract text from a PDF file."""
+    file_content = BytesIO(uploaded_file.read())
+    loader = UnstructuredPDFLoader(file_path=None, file=file_content)
+    return loader.load()
+
+
+def filter_complex_metadata(document):
+    """Ensure metadata values are of acceptable types."""
+    for key, value in document.metadata.items():
+        if isinstance(value, (str, int, float, bool)):
+            continue
+        elif value is None:
+            document.metadata[key] = "None"  # Replace None with a string
+        else:
+            del document.metadata[key]  # Remove complex metadata
+    return document
+
+
+def create_vector_db(data, model_name='nomic-embed-text'):
+    """Create a vector database from document chunks."""
+    data = [filter_complex_metadata(doc) for doc in data]
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = text_splitter.split_documents(data)
+
+    vector_db = Chroma.from_documents(
+        documents=chunks,
+        embedding=OllamaEmbeddings(model=model_name, show_progress=True),
+        collection_name="local-rag"
+    )
+    return vector_db
+
+
+def setup_retriever_and_llm(vector_db, model_name="mistral"):
+    """Set up the language model chain for question answering."""
+    llm = ChatOllama(model=model_name)
+    query_prompt = PromptTemplate(
+        input_variables=["question"],
+        template="""You are an AI language model assistant. Your task is to generate five different versions of the given user question to retrieve relevant documents from a vector database. By generating multiple perspectives on the user question, your goal is to help the user overcome some of the limitations of the distance-based similarity search. Provide these alternative questions separately by newline.
+        Original question:{question}"""
+    )
+
+    retriever = MultiQueryRetriever.from_llm(
+        vector_db.as_retriever(),
+        llm,
+        prompt=query_prompt
+    )
+
+    template = """Answer the question based ONLY on the following context:{context}. Question:{question}"""
+    prompt = ChatPromptTemplate.from_template(template)
+
+    chain = (
+            {"context": retriever, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+    )
+    return chain
+
+
+def extract_first_page_text(uploaded_file):
+    """Extract and return the header text from the first page of the PDF."""
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            first_page = pdf.pages[0]
+            image = first_page.to_image(resolution=150).original
+            cropped_image = image.crop((0, 0, image.width, image.height // 2))
+            text = pytesseract.image_to_string(cropped_image)
+            return text.strip()
+    except Exception as e:
+        st.error(f"Error extracting text from image: {str(e)}")
+    return None
+
+
+def display_results_in_dataframe(results_list, headers_list):
+    """Display results in a DataFrame with headers."""
+    df_data = []
+    for header, results in zip(headers_list, results_list):
+        row = {"Publication Info": header}
+        row.update(results)
+        df_data.append(row)
+    df = pd.DataFrame(df_data)
+    st.dataframe(df)
+
+
+def app():
+    st.title("Smart Research Assistant")
+
+    # Add a text input for the research field
+    research_field = st.text_input("Enter the field of study (e.g., Social Innovation, Healthcare, AI):")
+
+    # Add a dropdown for model selection
+    model_name = st.selectbox("Select the model", ["mistral", "llama2", "gemma"])
+
+    uploaded_files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
+    if uploaded_files:
+        total_files = len(uploaded_files)
+        progress_bar = st.progress(0)  # Initialize progress bar
+        progress_message = st.empty()  # Placeholder for progress messages
+        results_list = []  # Store results for each document
+        headers_list = []  # Store headers for each document
+
+        for i, uploaded_file in enumerate(uploaded_files):
+            progress_message.text(f"Processing document {i + 1}/{total_files}...")
+
+            # Extract text and create vector database for each document
+            documents = extract_pdf_text(uploaded_file)
+            vector_db = create_vector_db(documents, model_name=model_name)
+
+            # Extract the first page header text
+            header_text = extract_first_page_text(uploaded_file)
+            headers_list.append(header_text)
+
+            # Set up chain with selected model
+            chain = setup_retriever_and_llm(vector_db, model_name=model_name)
+
+            questions = [
+                f"What are the key research questions addressed in the context of {research_field}?",
+                f"What theoretical perspectives are discussed regarding {research_field}?",
+                f"What hypotheses are made about the scalability of {research_field}?",
+                f"What methodologies are employed to study the growth of {research_field}?",
+                f"What are the main findings related to the scalability and impact of {research_field}?"
+            ]
+
+            results = {}
+            for question in questions:
+                try:
+                    response = chain.invoke({"question": question})
+                    results[question] = response
+                except Exception as e:
+                    st.error(f"Error processing question '{question}': {str(e)}")
+
+            results_list.append(results)
+
+            # Update progress bar
+            progress_percentage = int(((i + 1) / total_files) * 100)
+            progress_bar.progress(progress_percentage)
+
+        progress_message.text("Completed processing all documents.")
+
+        # Display results for each document with the header in the first column
+        display_results_in_dataframe(results_list, headers_list)
+
+
+if __name__ == "__main__":
+    app()
